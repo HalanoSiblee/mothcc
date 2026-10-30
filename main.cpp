@@ -1,13 +1,60 @@
-/*
-g++ -std=c++17 -O3 -march=native -flto -fno-plt -fno-exceptions \
-    -fno-rtti -DNDEBUG -s -o mothcc main.cpp
-*/
 #include <iostream>
 #include <fstream>
 #include <sstream>
 #include <string>
 #include <vector>
 #include <cctype>
+#include <sys/stat.h>
+#include <unistd.h>
+#include <cerrno>
+#include <cstring>
+#include <climits>
+#include <cstdlib>
+#ifdef __linux__
+#include <sys/xattr.h>
+#endif
+enum class LineEnding {
+    LF, CRLF
+};
+static LineEnding detect_line_ending(const std::string & s) {
+    size_t crlf = 0, lf = 0;
+    for (size_t i = 0; i < s.size(); ++i) {
+        if (s[i] == '\n') {
+            if (i > 0 && s[i - 1] == '\r')++crlf;
+            else++lf;
+        }
+    }
+    return (crlf > lf) ? LineEnding::CRLF : LineEnding::LF;
+}
+
+static void apply_line_ending(std::string & s, LineEnding le) {
+    if (le == LineEnding::LF) {
+        std::string out;
+        out.reserve(s.size());
+        for (size_t i = 0; i < s.size(); ++i) {
+            if (s[i] == '\r' && i + 1 < s.size() && s[i + 1] == '\n')continue;
+            out += s[i];
+        }
+        s.swap(out);
+        return;
+    }
+    std::string out;
+    out.reserve(s.size() + s.size() / 20 + 16);
+    for (size_t i = 0; i < s.size(); ++i) {
+        if (s[i] == '\n' && (i == 0 || s[i - 1] != '\r'))out += '\r';
+        out += s[i];
+    }
+    s.swap(out);
+}
+
+static bool stat_changed(const struct stat & a, const struct stat & b) {
+#if defined(__APPLE__)
+    return a.st_mtimespec.tv_sec != b.st_mtimespec.tv_sec || a.st_mtimespec.tv_nsec != b.st_mtimespec.tv_nsec || a.st_size != b.st_size;
+#else
+    return a.st_mtim.tv_sec != b.st_mtim.tv_sec || a.st_mtim.tv_nsec != b.st_mtim.tv_nsec || a.st_size != b.st_size;
+#endif
+}
+
 std::string cleancc(const std::string & src) {
     std::string out;
     out.reserve(src.size());
@@ -35,7 +82,7 @@ std::string cleancc(const std::string & src) {
                     i += 2;
                     continue;
                 }
-                if (src[i] == '\n')break;
+                if (src[i] == '\n' || src[i] == '\r')break;
                 ++i;
             }
             continue;
@@ -471,19 +518,108 @@ std::string prettiercc(const std::string & src) {
     return out;
 }
 
+static bool overwrite_file(const std::string & path, const std::string & data, const struct stat * expected_stat) {
+    std::string real_path = path;
+    char resolved[PATH_MAX];
+    if (realpath(path.c_str(), resolved))real_path = resolved;
+    struct stat st {
+    };
+    bool have_stat = (stat(real_path.c_str(), &st) == 0);
+    if (have_stat && !S_ISREG(st.st_mode)) {
+        std::cerr << "nuke: not a regular file: " << real_path << "\n";
+        return false;
+    }
+    std::string tmpl = real_path + ".nuke.XXXXXX";
+    std::vector<char> buf(tmpl.begin(), tmpl.end());
+    buf.push_back('\0');
+    int fd = mkstemp(buf.data());
+    if (fd < 0) {
+        std::cerr << "nuke: mkstemp(" << real_path << "): " << std::strerror(errno) << "\n";
+        return false;
+    }
+    std::string tmp_path(buf.data());
+    const char *p = data.data();
+    size_t remaining = data.size();
+    while (remaining > 0) {
+        ssize_t n = write(fd, p, remaining);
+        if (n < 0) {
+            if (errno == EINTR)continue;
+            std::cerr << "nuke: write(" << tmp_path << "): " << std::strerror(errno) << "\n";
+            close(fd);
+            unlink(tmp_path.c_str());
+            return false;
+        }
+        p += n;
+        remaining -= (size_t)n;
+    }
+    if (have_stat) {
+        fchmod(fd, st.st_mode & 07777);
+        fchown(fd, st.st_uid, st.st_gid);
+#ifdef __linux__
+        ssize_t listlen = listxattr(real_path.c_str(), nullptr, 0);
+        if (listlen > 0) {
+            std::vector<char> names((size_t)listlen);
+            if (listxattr(real_path.c_str(), names.data(), (size_t)listlen) > 0) {
+                char *q = names.data();
+                char *end = names.data() + listlen;
+                while (q < end) {
+                    std::string name(q);
+                    q += name.size() + 1;
+                    ssize_t vlen = getxattr(real_path.c_str(), name.c_str(), nullptr, 0);
+                    if (vlen > 0) {
+                        std::vector<char> val((size_t)vlen);
+                        if (getxattr(real_path.c_str(), name.c_str(), val.data(), (size_t)vlen) == vlen)fsetxattr(fd, name.c_str(), val.data(), (size_t)vlen, 0);
+                    }
+                }
+            }
+        }
+#endif
+    }
+    if (fsync(fd) < 0) {
+        std::cerr << "nuke: warning: fsync(" << tmp_path << "): " << std::strerror(errno) << "\n";
+    }
+    if (close(fd) < 0) {
+        std::cerr << "nuke: close(" << tmp_path << "): " << std::strerror(errno) << "\n";
+        unlink(tmp_path.c_str());
+        return false;
+    }
+    if (expected_stat) {
+        struct stat now {
+        };
+        if (stat(real_path.c_str(), &now) == 0 && stat_changed( *expected_stat, now)) {
+            std::cerr << "nuke: " << real_path << " changed during processing, aborting\n";
+            unlink(tmp_path.c_str());
+            return false;
+        }
+    }
+    if (rename(tmp_path.c_str(), real_path.c_str()) < 0) {
+        std::cerr << "nuke: rename(" << tmp_path << " -> " << real_path << "): " << std::strerror(errno) << "\n";
+        unlink(tmp_path.c_str());
+        return false;
+    }
+    return true;
+}
+
 static void usage(const char *prog) {
-    std::cout << "usage: " << prog << " [options] [input-file]\n" "  -c        clean comments only\n" "  -p        prettify only (input must already be comment-free)\n" "  -o FILE   write output to FILE (default stdout)\n" "  -h        show this help\n" "  input '-' or omitted => read from stdin\n" "Default: cleancc() then prettiercc().\n";
+    std::cout << "usage: " << prog << " [options] [input-file]\n" "\n" "Modes (default: clean + prettify):\n" "  -c, --clean         strip comments only\n" "  -p, --pretty        reformat only (input must be comment-free)\n" "\n" "Output:\n" "  -o FILE             write to FILE (default: stdout)\n" "  -ov, --overwrite    rewrite input file in place (atomic)\n" "  -i                  alias for -ov (sed -i style)\n" "  -b, --backup        with -ov: save original to FILE.bak\n" "  --check             exit 1 if file would change, 0 if clean\n" "\n" "Other:\n" "  -h, --help          show this help\n" "\n" "Input '-' or omitted reads from stdin.\n" "\n" "Examples:\n" "  " << prog << " foo.cpp > foo.clean.cpp\n" "  " << prog << " -c foo.c                  # comments only, to stdout\n" "  " << prog << " -i src/*.cpp              # rewrite in place, keep mtime if no-op\n" "  " << prog << " -i -b src/foo.cpp         # ...and save foo.cpp.bak first\n" "  " << prog << " --check src/*.cpp         # CI: fail if any file needs cleaning\n";
 }
 
 int main(int argc, char * *argv) {
     bool cleanOnly = false;
     bool prettyOnly = false;
+    bool overwrite = false;
+    bool backup = false;
+    bool check = false;
     std::string infile, outfile;
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         if (a == "-c" || a == "--clean")cleanOnly = true;
         else if (a == "-p" || a == "--pretty")prettyOnly = true;
         else if (a == "-o" && i + 1 < argc)outfile = argv[ ++i];
+        else if (a == "-ov" || a == "--overwrite")overwrite = true;
+        else if (a == "-i")overwrite = true;
+        else if (a == "-b" || a == "--backup")backup = true;
+        else if (a == "--check")check = true;
         else if (a == "-h" || a == "--help") {
             usage(argv[0]);
             return 0;
@@ -491,6 +627,32 @@ int main(int argc, char * *argv) {
             std::cerr << "unknown option: " << a << "\n";
             return 1;
         } else infile = a;
+    }
+    if (overwrite && !outfile.empty()) {
+        std::cerr << "nuke: -ov and -o are mutually exclusive\n";
+        return 1;
+    }
+    if (overwrite && (infile.empty() || infile == "-")) {
+        std::cerr << "nuke: -ov requires a file path, not stdin\n";
+        return 1;
+    }
+    if (backup && !overwrite) {
+        std::cerr << "nuke: -b requires -ov\n";
+        return 1;
+    }
+    if (check && (overwrite || !outfile.empty() || backup)) {
+        std::cerr << "nuke: --check cannot be combined with -ov/-o/-b\n";
+        return 1;
+    }
+    if (check && (infile.empty() || infile == "-")) {
+        std::cerr << "nuke: --check requires a file path, not stdin\n";
+        return 1;
+    }
+    struct stat src_stat_before {
+    };
+    bool have_stat_before = false;
+    if (!infile.empty() && infile != "-") {
+        if (stat(infile.c_str(), &src_stat_before) == 0)have_stat_before = true;
     }
     std::string src;
     if (infile.empty() || infile == "-") {
@@ -507,10 +669,42 @@ int main(int argc, char * *argv) {
         ss << f.rdbuf();
         src = ss.str();
     }
+    LineEnding src_le = detect_line_ending(src);
+    bool had_trailing_nl = !src.empty() && src.back() == '\n';
+    bool ran_prettier = !cleanOnly;
     std::string result;
     if (cleanOnly)result = cleancc(src);
     else if (prettyOnly)result = prettiercc(src);
     else result = prettiercc(cleancc(src));
+    if (ran_prettier && !had_trailing_nl) {
+        if (!result.empty() && result.back() == '\n')result.pop_back();
+    }
+    apply_line_ending(result, src_le);
+    if (check) {
+        if (result == src)return 0;
+        std::cerr << "nuke: " << infile << " would be modified\n";
+        return 1;
+    }
+    if (overwrite) {
+        if (result == src)return 0;
+        if (backup) {
+            std::string bak = infile + ".bak";
+            std::ofstream bf(bak, std::ios::binary | std::ios::trunc);
+            if (!bf) {
+                std::cerr << "nuke: cannot create " << bak << "\n";
+                return 1;
+            }
+            bf.write(src.data(), (std::streamsize)src.size());
+            if (!bf) {
+                std::cerr << "nuke: write failed for " << bak << "\n";
+                return 1;
+            }
+            std::cerr << "nuke: backed up " << infile << " -> " << bak << "\n";
+        }
+        if (!overwrite_file(infile, result, have_stat_before ? &src_stat_before : nullptr))return 1;
+        std::cerr << "nuke: rewrote " << infile << "\n";
+        return 0;
+    }
     if (outfile.empty() || outfile == "-") {
         std::cout << result;
     } else {
